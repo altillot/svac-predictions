@@ -1,0 +1,448 @@
+---
+title: "Predicting Sexual Violence in Armed Conflict (SVAC)"
+author: "Andrea Tillotson"
+date: "12/22/2021"
+output: pdf_document
+---
+
+# Introduction
+
+IGOs (international governmental organizations) like the United Nations and human rights NGOs (non-governmental organizations) like Amnesty International and Human Rights Watch have an interest in predicting what kinds of violence will occur during an armed conflict in order to better allocate and provide resources to communities that need them.
+
+Sexual violence in armed conflicts (SVAC) is a challenging form of violence to detect in real time because it is not often an official or publicly known conflict event, unlike battles or other confrontations between militant and rebel groups. Being able to predict where and to what degree SVAC will occur would be valuable information for groups like the UN and human rights NGOs that are in a position to support communities facing violence during conflicts.
+
+# The Data
+
+The Sexual Violence in Armed Conflict dataset provides three sexual violence prevalence scores per armed conflict between 1989-2019 based on content analysis of State Department, Human Rights Watch, and Amnesty International reports. The data are available at the conflict-year level and are disaggregated by actor. The World Bank has data with over 50 indicator variables for over 200 countries and territories. The indicators include information on population sizes, GDP, mortality rates, fertility rates, and more.
+
+
+
+```{r, message = FALSE}
+# load packages
+library(tidyverse)
+library(tidymodels)
+
+# loading data
+svac <- readxl::read_excel("SVAC_3.0_conflictyears (1).xlsx")
+worldbank <- readr::read_csv("WorldBankData.csv", na = "..")
+```
+
+# Regression model to predict SVAC prevalence
+
+## Data Wrangling
+
+### SVAC Dataset
+```{r}
+svac <- svac %>%
+  naniar::replace_with_na_all(condition = ~.x == -99)
+
+svac <- svac %>% rowwise() %>%
+  mutate(prev_avg = mean(c(state_prev, hrw_prev, ai_prev),
+                         na.rm = TRUE)) %>%
+  filter(prev_avg != "NaN") %>%
+  select(gwnoloc, prev_avg)
+```
+### World Bank Dataset
+```{r}
+library(countrycode)
+
+worldbank <- worldbank %>% select(1:4, 20) %>%
+  slice_head(n = 11067) %>%
+  pivot_wider(id_cols = c(`Country Name`, `Country Code`),
+              names_from = `Series Name`,
+              values_from = `2015 [YR2015]`)
+
+low_missingness <- as.data.frame(colSums(is.na(worldbank)) / nrow(worldbank)) %>%
+  rownames_to_column() %>%
+  rename(na_share =`colSums(is.na(worldbank))/nrow(worldbank)`) %>%
+  filter(na_share < 0.4) %>%
+  select(rowname) %>%
+  pull()
+worldbank <- worldbank %>% select(all_of(low_missingness)) %>%
+  mutate(country = countrycode(`Country Code`, 
+                               origin = "wb", 
+                               destination = "gwn")
+         )
+
+worldbank[215, 42] <- 678
+
+worldbank <- worldbank %>% 
+  filter(!is.na(country)) %>%
+  rename(
+    country_name = `Country Name`,
+    iso3code = `Country Code`,
+    total_pop = `Population, total`,
+    growth_pop = `Population growth (annual %)`,
+    surface_area = `Surface area (sq. km)`,
+    gni_atlas = `GNI, Atlas method (current US$)`,
+    gni_atlas_percap = `GNI per capita, Atlas method (current US$)`,
+    gni_ppp = `GNI, PPP (current international $)`,
+    gni_ppp_percap = `GNI per capita, PPP (current international $)`,
+    life_expect = `Life expectancy at birth, total (years)`,
+    fertility = `Fertility rate, total (births per woman)`,
+    fertility_adol = `Adolescent fertility rate (births per 1,000 women ages 15-19)`,
+    mortality = `Mortality rate, under-5 (per 1,000 live births)`,
+    measles_imm = `Immunization, measles (% of children ages 12-23 months)`,
+    primary_completion = `Primary completion rate, total (% of relevant age group)`,
+    sec_enrollment = `School enrollment, secondary (% gross)`,
+    pri_enrollment = `School enrollment, primary and secondary (gross), gender parity index (GPI)`,
+    HIV_prev = `Prevalence of HIV, total (% of population ages 15-49)`,
+    forest_area = `Forest area (sq. km)`,
+    co2_emit = `CO2 emissions (metric tons per capita)`,
+    gdp = `GDP (current US$)`,
+    gdp_growth = `GDP growth (annual %)`,
+    inflation_gdp = `Inflation, GDP deflator (annual %)`,
+    gdp_agr = `Agriculture, forestry, and fishing, value added (% of GDP)`,
+    gdp_indust = `Industry (including construction), value added (% of GDP)`,
+    gdp_exports = `Exports of goods and services (% of GDP)`,
+    gdp_imports = `Imports of goods and services (% of GDP)`,
+    gdp_form = `Gross capital formation (% of GDP)`,
+    gdp_rev = `Revenue, excluding grants (% of GDP)`,
+    bus_regis = `Start-up procedures to register a business (number)`,
+    gdp_milit = `Military expenditure (% of GDP)`,
+    cell_sub = `Mobile cellular subscriptions (per 100 people)`,
+    high_tech = `High-technology exports (% of manufactured exports)`,
+    merch_trade = `Merchandise trade (% of GDP)`,
+    barter = `Net barter terms of trade index (2000 = 100)`,
+    remit = `Personal remittances, paid (current US$)`,
+    fdi_inflows = `Foreign direct investment, net inflows (BoP, current US$)`,
+    oda_percap = `Net ODA received per capita (current US$)`,
+    gdp_percap = `GDP per capita (current US$)`,
+    fdi_net = `Foreign direct investment, net (BoP, current US$)`,
+    inflation_consumer = `Inflation, consumer prices (annual %)`,
+    gwnoloc = country
+  )
+
+worldbank <- worldbank %>% mutate(bus_regis = as_factor(bus_regis)) %>%
+  filter(bus_regis != "NaN")
+```
+                                  
+
+### Merging
+
+```{r}
+svac_WB <- left_join(svac, worldbank) %>%
+  filter(prev_avg != "NaN")
+```
+
+## Random Forest Model
+
+```{r}
+# split the data
+set.seed(1105)
+svacWB_split <- initial_split(svac_WB, prop = 0.8)
+svacWB_train <- training(svacWB_split)
+svacWB_test <- testing(svacWB_split)
+
+# define the recipe
+base_recipe <-
+  recipe(prev_avg ~ ., data = svacWB_train) %>%
+  step_rm(country_name, iso3code, gwnoloc) %>%
+  step_impute_mode(all_nominal_predictors()) %>%
+  step_other(all_nominal_predictors()) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_impute_mean(all_numeric_predictors()) %>%
+  step_center(all_predictors()) %>%
+  step_scale(all_predictors())
+
+# solve the optimization problem
+svacWB_model <-
+  rand_forest() %>%
+  set_mode("regression")
+svacWB_wf <-
+  workflow() %>%
+  add_model(svacWB_model) %>%
+  add_recipe(base_recipe)
+svacWB_fit <- fit(svacWB_wf, data = svacWB_train)
+
+# predict in the testing data
+svacWB_pred <- predict(svacWB_fit, new_data = svacWB_test)
+
+# evaluate in the testing data
+rmse_vec(svacWB_test$prev_avg, svacWB_pred %>% 
+           pull(.pred))
+```
+
+## Elastic Net Model
+
+```{r, message = FALSE}
+# solve the optimization problem
+glmnet_model <-
+  linear_reg(penalty = tune(), mixture = tune()) %>%
+  set_mode("regression") %>%
+  set_engine("glmnet")
+glmnet_wf <-
+  workflow() %>%
+  add_model(glmnet_model) %>%
+  add_recipe(base_recipe)
+
+glmnet_rs <- bootstraps(svacWB_train, times = 20)
+glmnet_grid <- grid_regular(parameters(glmnet_model),
+                            levels = 20)
+
+glmnet_results <- tune_grid(glmnet_wf, resamples = glmnet_rs,
+                            grid = glmnet_grid)
+
+lowest_rmse <-
+  glmnet_results %>%
+  select_best("rmse")
+
+final_wf <- finalize_workflow(glmnet_wf,
+                              lowest_rmse)
+
+glmnet_fit <- fit(final_wf, data = svacWB_train)
+
+# predict in the testing data
+glmnet_pred <- predict(glmnet_fit, new_data = svacWB_test)
+
+# evaluate in the testing data
+rmse_vec(svacWB_test$prev_avg, glmnet_pred %>% 
+           pull(.pred))
+```
+
+## MARS Model
+
+```{r}
+# solve the optimization problem
+mars_model <-
+  mars() %>%
+  set_mode("regression")
+mars_wf <-
+  workflow() %>%
+  add_model(mars_model) %>%
+  add_recipe(base_recipe)
+mars_fit <- fit(mars_wf, data = svacWB_train)
+
+# predict in the testing data
+mars_predict <- predict(mars_fit, new_data = svacWB_test)
+
+# evaluate in the testing data
+rmse_vec(svacWB_test$prev_avg, mars_predict %>% 
+           pull(.pred))
+```
+
+## Predicting SVAC prevalence by country
+
+```{r}
+wb_pred <- predict(mars_fit, new_data = worldbank)
+wb_svac <- bind_cols(worldbank, wb_pred) %>%
+  rename(svac_prediction = .pred)
+wb_svac %>% select(country_name, svac_prediction) %>%
+  arrange(desc(svac_prediction)) %>%
+  head()
+wb_svac %>% select(country_name, svac_prediction) %>%
+  arrange(svac_prediction) %>%
+  head()
+```
+
+
+# Classification model to predict SVAC type
+
+## Data Wrangling
+```{r}
+svac_class <- readxl::read_excel("SVAC_3.0_conflictyears (1).xlsx")
+
+# separating the form column out
+svac_class <- svac_class %>%
+  separate(form, into = c("one", "two", "three", "four", "five"),
+           sep = ", ")
+# making the new columns numeric variables
+svac_class <- transform(svac_class,
+                        one = as.numeric(one),
+                        two = as.numeric(two),
+                        three = as.numeric(three),
+                        four = as.numeric(four),
+                        five = as.numeric(five))
+# creating dummy variables for the different forms of violence
+svac_class <- svac_class %>% 
+  mutate(
+    rape = case_when(
+      one == 1 ~ 1,
+      is.numeric(one) ~ 0
+      ),
+    sexslv = case_when(
+      one == 2 ~ 1,
+      two == 2 ~ 1,
+      is.numeric(one) ~ 0,
+      is.numeric(two) ~ 0
+      ),
+    fprost = case_when(
+      one == 3 ~ 1,
+      two == 3 ~ 1,
+      three == 3 ~ 1,
+      is.numeric(one) ~ 0,
+      is.numeric(two) ~ 0,
+      is.numeric(three) ~ 0
+      ),
+    fpreg = case_when(
+      one == 4 ~ 1,
+      two == 4 ~ 1,
+      three == 4 ~ 1,
+      four == 4 ~ 1,
+      is.numeric(one) ~ 0,
+      is.numeric(two) ~ 0,
+      is.numeric(three) ~ 0,
+      is.numeric(four) ~ 0
+      ),
+    fsteril_ab = case_when(
+      one == 5 ~ 1,
+      two == 5 ~ 1,
+      three == 5 ~ 1,
+      four == 5 ~ 1,
+      five == 5 ~ 1,
+      is.numeric(one) ~ 0,
+      is.numeric(two) ~ 0,
+      is.numeric(three) ~ 0,
+      is.numeric(four) ~ 0,
+      is.numeric(five) ~ 0
+      ),
+    mutil = case_when(
+      one == 6 ~ 1,
+      two == 6 ~ 1,
+      three == 6 ~ 1,
+      four == 6 ~ 1,
+      five == 6 ~ 1,
+      is.numeric(one) ~ 0,
+      is.numeric(two) ~ 0,
+      is.numeric(three) ~ 0,
+      is.numeric(four) ~ 0,
+      is.numeric(five) ~ 0
+      ),
+    torture = case_when(
+      one == 7 ~ 1,
+      two == 7 ~ 1,
+      three == 7 ~ 1,
+      four == 7 ~ 1,
+      five == 7 ~ 1,
+      is.numeric(one) ~ 0,
+      is.numeric(two) ~ 0,
+      is.numeric(three) ~ 0,
+      is.numeric(four) ~ 0,
+      is.numeric(five) ~ 0
+      )
+    )
+
+# dropping columns that are no longer needed
+svac_class <- svac_class %>%
+  select(c(sexslv, gwnoloc)) %>%
+  group_by(gwnoloc) %>%
+  count(sexslv) %>%
+  mutate(sexslv = case_when(sexslv > 0 ~ 1,
+                            sexslv <= 0 ~ 0),
+         sexslv = as_factor(sexslv)
+  ) %>%
+  select(-n) %>%
+  ungroup()
+```
+
+## Merging
+
+```{r, message = FALSE}
+svacWB_class <- left_join(svac_class, worldbank)
+```
+
+## Random Forest Model
+
+```{r}
+# split the data
+set.seed(1105)
+class_split <- initial_split(svacWB_class, prop = 0.8)
+class_train <- training(class_split)
+class_test <- testing(class_split)
+
+# define the recipe
+class_recipe <-
+  recipe(sexslv ~ ., data = class_train) %>%
+  step_rm(country_name, iso3code, gwnoloc) %>%
+  step_dummy(bus_regis) %>%
+  step_impute_knn(all_nominal_predictors()) %>%
+  step_impute_mean(all_numeric_predictors()) %>%
+  step_center(all_numeric_predictors()) %>%
+  step_scale(all_numeric_predictors())
+
+# solve the optimization problem
+rf_class_model <-
+  rand_forest() %>%
+  set_mode("classification")
+rf_class_wf <-
+  workflow() %>%
+  add_model(rf_class_model) %>%
+  add_recipe(class_recipe)
+rf_class_fit <-
+  fit(rf_class_wf, data = class_train)
+
+# predict in the testing data
+rf_class_pred <-
+  predict(rf_class_fit, new_data = class_test)
+
+# evaluate in the testing data
+bind_cols(class_test, rf_class_pred) %>%
+  conf_mat(truth = sexslv, estimate = .pred_class)
+```
+
+```{r}
+# solve the optimization problem
+logistic_model <-
+  logistic_reg(penalty = tune(), mixture = tune()) %>%
+  set_mode("classification") %>%
+  set_engine("glmnet")
+logistic_wf <-
+  workflow() %>%
+  add_model(logistic_model) %>%
+  add_recipe(class_recipe)
+
+logistic_rs <- bootstraps(class_train, times = 20)
+logistic_grid <- grid_regular(parameters(logistic_model),
+                              levels = 20)
+
+logistic_results <- tune_grid(logistic_wf, resamples = logistic_rs,
+                              grid = logistic_grid)
+
+most_accurate <-
+  logistic_results %>%
+  select_best("accuracy")
+
+final_log_wf <- finalize_workflow(logistic_wf,
+                                  most_accurate)
+
+logistic_fit <- fit(final_log_wf, data = class_train)
+
+# predict in the testing data
+logistic_pred <- predict(logistic_fit, new_data = class_test)
+
+# evaluate in the testing data
+bind_cols(class_test, logistic_pred) %>%
+  conf_mat(truth = sexslv, estimate = .pred_class)
+```
+
+```{r}
+# solve the optimization problem
+bart_model <-
+  parsnip::bart(trees = tune()) %>%
+  set_mode("classification")
+bart_wf <-
+  workflow() %>%
+  add_model(bart_model) %>%
+  add_recipe(class_recipe)
+
+bart_rs <- bootstraps(class_train, times = 20)
+bart_grid <- grid_regular(parameters(bart_model),
+                          levels = 20)
+bart_results <- tune_grid(bart_wf, resamples = bart_rs,
+                          grid = bart_grid)
+bart_accurate <-
+  bart_results %>%
+  select_best("accuracy")
+
+final_bart_wf <-
+  finalize_workflow(bart_wf,
+                    bart_accurate)
+bart_fit <- fit(final_bart_wf, data = class_train)
+
+# predict in the testing data
+bart_pred <- predict(bart_fit, new_data = class_test)
+
+# evaluate in the testing data
+bind_cols(class_test, bart_pred) %>%
+  conf_mat(truth = sexslv, estimate = .pred_class)
+```
